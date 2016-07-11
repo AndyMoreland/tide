@@ -87,11 +87,15 @@
 (tide-def-permanent-buffer-local tide-buffer-dirty nil)
 (tide-def-permanent-buffer-local tide-buffer-tmp-file nil)
 
+;; Map from project name to process
 (defvar tide-servers (make-hash-table :test 'equal))
 (defvar tide-response-callbacks (make-hash-table :test 'equal))
 
 (defvar tide-source-root-directory (file-name-directory load-file-name))
-(defvar tide-tsserver-directory (expand-file-name "tsserver" tide-source-root-directory))
+;; (defvar tide-tsserver-directory (expand-file-name "tsserver" tide-source-root-directory))
+(defvar tide-tsserver-directory "/Users/amoreland/tsunami/lib/")
+
+(defvar tide-tsserver-filename "index.js")
 
 (defun tide-project-root ()
   "Project root folder determined based on the presence of tsconfig.json."
@@ -99,7 +103,8 @@
    tide-project-root
    (let ((root (locate-dominating-file default-directory "tsconfig.json")))
      (unless root
-       (error "Couldn't locate project root folder.  Please make sure to add tsconfig.json in project root folder"))
+       (message (tide-join (list "Couldn't locate project root folder with a tsconfig.json file. Using '" default-directory "' as project root.")))
+       (setq root default-directory))
      (let ((full-path (expand-file-name root)))
        (setq tide-project-root full-path)
        full-path))))
@@ -182,7 +187,11 @@ LINE is one based, OFFSET is one based and column is zero based"
 ;;; Server
 
 (defun tide-current-server ()
-  (gethash (tide-project-name) tide-servers))
+  (let ((process (gethash (tide-project-name) tide-servers)))
+    (when process
+      (if (equal 'run (process-status process))
+          process
+        (error "Zombie entry in server list")))))
 
 (defun tide-next-request-id ()
   (number-to-string (incf tide-request-counter)))
@@ -202,8 +211,8 @@ LINE is one based, OFFSET is one based and column is zero based"
 (defun tide-send-command (name args &optional callback)
   (when (not (tide-current-server))
     (error "Server does not exists.  Run M-x tide-restart-server to start it again"))
-
-  (when tide-buffer-dirty
+  (when (and tide-buffer-dirty
+             (not tsunami-change-syncing-mode))
     (tide-sync-buffer-contents))
 
   (let* ((request-id (tide-next-request-id))
@@ -234,7 +243,7 @@ LINE is one based, OFFSET is one based and column is zero based"
 
 (defun tide-net-sentinel (process message)
   (let ((project-name (process-get process 'project-name)))
-    (message "(%s) tsserver exists: %s." project-name (string-trim message))
+    (message "(%s) tsserver died: [%s.]" project-name (string-trim message))
     (ignore-errors
       (kill-buffer (process-buffer process)))
     (tide-cleanup-project project-name)))
@@ -242,12 +251,13 @@ LINE is one based, OFFSET is one based and column is zero based"
 (defun tide-start-server ()
   (when (tide-current-server)
     (error "Server already exists"))
-
   (message "(%s) Starting tsserver..." (tide-project-name))
   (let* ((default-directory (tide-project-root))
          (process-environment (append tide-tsserver-process-environment process-environment))
          (buf (generate-new-buffer tide-server-buffer-name))
-         (process (start-file-process "tsserver" buf "node" (expand-file-name "tsserver.js" tide-tsserver-directory))))
+         (process (start-file-process "tsserver" buf "node" (let ((filename (expand-file-name tide-tsserver-filename tide-tsserver-directory)))
+                                                              (message filename)
+                                                              filename))))
     (set-process-coding-system process 'utf-8-unix 'utf-8-unix)
     (set-process-filter process #'tide-net-filter)
     (set-process-sentinel process #'tide-net-sentinel)
@@ -256,13 +266,14 @@ LINE is one based, OFFSET is one based and column is zero based"
     (message "(%s) tsserver server started successfully." (tide-project-name))))
 
 (defun tide-cleanup-buffer-callbacks ()
-  (let ((error-response `(:success ,nil)))
-    (maphash
-     (lambda (id callback)
-       (when (equal (current-buffer) (car callback))
-         (funcall (cdr callback) error-response)
-         (remhash id tide-response-callbacks)))
-     tide-response-callbacks)))
+  (ignore-errors
+    (let ((error-response `(:success ,nil)))
+      (maphash
+       (lambda (id callback)
+         (when (equal (current-buffer) (car callback))
+           (funcall (cdr callback) error-response)
+           (remhash id tide-response-callbacks)))
+       tide-response-callbacks))))
 
 (defun tide-cleanup-project (project-name)
   (tide-each-buffer project-name
@@ -590,7 +601,7 @@ With a prefix arg, Jump to the type definition."
                       (lambda (cb)
                         (tide-command:completions arg cb))))
     (sorted t)
-    (meta (tide-completion-meta arg))
+    ;; (meta (tide-completion-meta arg)) ; commented out for performance
     (annotation (tide-completion-annotation (get-text-property 0 'completion arg)))
     (doc-buffer (tide-completion-doc-buffer arg))))
 
@@ -632,6 +643,7 @@ With a prefix arg, Jump to the type definition."
     (define-key map (kbd "n") #'tide-find-next-reference)
     (define-key map (kbd "p") #'tide-find-previous-reference)
     (define-key map (kbd "C-m") #'tide-goto-reference)
+    (define-key map (kbd "q") #'bury-buffer) ;; ANDY added this
     map))
 
 (define-derived-mode tide-references-mode nil "tide-references"
@@ -717,6 +729,7 @@ number."
 (defun tide-command:navbar ()
   (tide-send-command-sync "navbar" `(:file ,buffer-file-name)))
 
+;; CHANGE BY ANDY: Remove the module/aliases from the index.
 (defun tide-imenu-index ()
   (let ((response (tide-command:navbar)))
     (when (tide-response-success-p response)
@@ -724,7 +737,13 @@ number."
        (lambda (item)
          (cons (concat (plist-get item :text) " " (propertize (plist-get item :kind) 'face 'tide-imenu-type-face))
                (tide-span-to-position (plist-get (car (plist-get item :spans)) :start))))
-       (tide-flatten-navitem (plist-get response :body))))))
+       (tide-flatten-navitem (-filter
+                              (lambda (el)
+                                (let ((navitem-kind (plist-get el :kind)))
+                                  (not
+                                   (or (equal "module" navitem-kind)
+                                       (equal "alias" navitem-kind)))))
+                              (plist-get response :body)))))))
 
 
 ;;; Rename
@@ -796,8 +815,10 @@ number."
   (tide-command:openfile))
 
 (defun tide-cleanup-buffer ()
-  (tide-command:closefile)
-  (tide-remove-tmp-file))
+  (ignore-errors
+    (progn
+      (tide-command:closefile)
+      (tide-remove-tmp-file))))
 
 ;;;###autoload
 (defun tide-setup ()
