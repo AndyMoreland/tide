@@ -4,9 +4,9 @@
 
 ;; Author: Anantha kumaran <ananthakumaran@gmail.com>
 ;; URL: http://github.com/ananthakumaran/tide
-;; Version: 1.7.3
+;; Version: 2.0.0-beta
 ;; Keywords: typescript
-;; Package-Requires: ((dash "2.10.0") (flycheck "0.23") (emacs "24.1") (typescript-mode "0.1"))
+;; Package-Requires: ((dash "2.10.0") (flycheck "27") (emacs "24.1") (typescript-mode "0.1") (cl-lib "0.5"))
 
 ;; This program is free software: you can redistribute it and/or modify it
 ;; under the terms of the GNU General Public License as published by
@@ -30,7 +30,7 @@
 (require 'typescript-mode)
 (require 'etags)
 (require 'json)
-(require 'cl)
+(require 'cl-lib)
 (require 'eldoc)
 (require 'dash)
 (require 'flycheck)
@@ -50,6 +50,18 @@
   "List of extra environment variables to use when starting tsserver."
   :type '(repeat string)
   :group 'tide)
+
+(defcustom tide-tsserver-executable "/Users/amoreland/tsunami/lib/index.js"
+  "Name of tsserver executable to run instead of the bundled tsserver.
+
+This may either be a path or a name to be looked up in
+`exec-path'. Note that this option only works with TypeScript
+version 2.0 and above."
+  :type '(choice (const nil) string)
+  :group 'tide)
+
+(defvar tide-format-options '()
+  "Format options plist.")
 
 (defface tide-file
   '((t (:inherit dired-header)))
@@ -71,6 +83,11 @@
   "Face for type in imenu list."
   :group 'tide)
 
+(defcustom tide-jump-to-definition-reuse-window t
+  "Reuse existing window when jumping to definition."
+  :type 'boolean
+  :group 'tide)
+
 (defmacro tide-def-permanent-buffer-local (name &optional init-value)
   "Declare NAME as buffer local variable."
   `(progn
@@ -78,7 +95,7 @@
      (make-variable-buffer-local ',name)
      (put ',name 'permanent-local t)))
 
-(defvar tide-supported-modes '(typescript-mode web-mode))
+(defvar tide-supported-modes '(typescript-mode web-mode js-mode js2-mode js2-jsx-mode js3-mode))
 
 (defvar tide-server-buffer-name "*tide-server*")
 (defvar tide-request-counter 0)
@@ -101,9 +118,10 @@
   "Project root folder determined based on the presence of tsconfig.json."
   (or
    tide-project-root
-   (let ((root (locate-dominating-file default-directory "tsconfig.json")))
+   (let ((root (or (locate-dominating-file default-directory "tsconfig.json")
+                   (locate-dominating-file default-directory "jsconfig.json"))))
      (unless root
-       (message (tide-join (list "Couldn't locate project root folder with a tsconfig.json file. Using '" default-directory "' as project root.")))
+       (message (tide-join (list "Couldn't locate project root folder with a tsconfig.json or jsconfig.json file. Using '" default-directory "' as project root.")))
        (setq root default-directory))
      (let ((full-path (expand-file-name root)))
        (setq tide-project-root full-path)
@@ -115,12 +133,26 @@
 ;;; Helpers
 
 (defun tide-plist-get (list &rest args)
-  (reduce
+  (cl-reduce
    (lambda (object key)
      (when object
        (plist-get object key)))
    args
    :initial-value list))
+
+(defun tide-combine-plists (&rest plists)
+  "Create a single property list from all plists in PLISTS.
+The process starts by copying the first list, and then setting properties
+from the other lists. Settings in the last list are the most significant
+ones and overrule settings in the other lists."
+  (let ((rtn (copy-sequence (pop plists)))
+        p v ls)
+    (while plists
+      (setq ls (pop plists))
+      (while ls
+        (setq p (pop ls) v (pop ls))
+        (setq rtn (plist-put rtn p v))))
+    rtn))
 
 (defun tide-response-success-p (response)
   (and response (equal (plist-get response :success) t)))
@@ -145,11 +177,27 @@
                    (equal (tide-project-name) project-name))
           (funcall fn))))))
 
+(defun tide-line-number-at-pos (&optional pos)
+  (let ((p (or pos (point))))
+    (if (= (point-min) 1)
+        (line-number-at-pos p)
+      (save-excursion
+        (save-restriction
+          (widen)
+          (line-number-at-pos p))))))
+
 (defun tide-current-offset ()
   "Number of characters present from the begining of line to cursor in current line.
 
 offset is one based."
   (1+ (- (point) (line-beginning-position))))
+
+(defun tide-offset (pos)
+  (save-excursion
+    (save-restriction
+      (widen)
+      (goto-char pos)
+      (tide-current-offset))))
 
 (defun tide-column (line offset)
   "Return column number corresponds to the LINE and OFFSET.
@@ -163,7 +211,7 @@ LINE is one based, OFFSET is one based and column is zero based"
       (beginning-of-line)
       (while (> offset 1)
         (forward-char)
-        (decf offset))
+        (cl-decf offset))
       (1+ (current-column)))))
 
 (defun tide-span-to-position (span)
@@ -194,7 +242,7 @@ LINE is one based, OFFSET is one based and column is zero based"
         (error "Zombie entry in server list")))))
 
 (defun tide-next-request-id ()
-  (number-to-string (incf tide-request-counter)))
+  (number-to-string (cl-incf tide-request-counter)))
 
 (defun tide-dispatch-response (response)
   (let* ((request-id (plist-get response :request_seq))
@@ -205,15 +253,14 @@ LINE is one based, OFFSET is one based and column is zero based"
       (remhash request-id tide-response-callbacks))))
 
 (defun tide-dispatch (response)
-  (case (intern (plist-get response :type))
+  (cl-case (intern (plist-get response :type))
     ('response (tide-dispatch-response response))))
 
 (defun tide-send-command (name args &optional callback)
   (when (not (tide-current-server))
-    (error "Server does not exists.  Run M-x tide-restart-server to start it again"))
-  (when (and tide-buffer-dirty
-             (not tsunami-change-syncing-mode))
-    (tide-sync-buffer-contents))
+    (error "Server does not exist. Run M-x tide-restart-server to start it again"))
+
+  (tide-sync-buffer-contents)
 
   (let* ((request-id (tide-next-request-id))
          (command `(:command ,name :seq ,request-id :arguments ,args))
@@ -243,24 +290,26 @@ LINE is one based, OFFSET is one based and column is zero based"
 
 (defun tide-net-sentinel (process message)
   (let ((project-name (process-get process 'project-name)))
-    (message "(%s) tsserver died: [%s.]" project-name (string-trim message))
+    (message "(%s) tsserver exits: %s." project-name (string-trim message))
     (ignore-errors
       (kill-buffer (process-buffer process)))
     (tide-cleanup-project project-name)))
 
 (defun tide-start-server ()
   (when (tide-current-server)
-    (error "Server already exists"))
+    (error "Server already exist"))
   (message "(%s) Starting tsserver..." (tide-project-name))
   (let* ((default-directory (tide-project-root))
          (process-environment (append tide-tsserver-process-environment process-environment))
          (buf (generate-new-buffer tide-server-buffer-name))
-         (process (start-file-process "tsserver" buf "node" (let ((filename (expand-file-name tide-tsserver-filename tide-tsserver-directory)))
-                                                              (message filename)
-                                                              filename))))
+         (process
+          (if tide-tsserver-executable
+              (start-file-process "tsserver" buf "node" tide-tsserver-executable)
+            (start-file-process "tsserver" buf "node" (expand-file-name "tsserver.js" tide-tsserver-directory)))))
     (set-process-coding-system process 'utf-8-unix 'utf-8-unix)
     (set-process-filter process #'tide-net-filter)
     (set-process-sentinel process #'tide-net-sentinel)
+    (set-process-query-on-exit-flag process nil)
     (process-put process 'project-name (tide-project-name))
     (puthash (tide-project-name) process tide-servers)
     (message "(%s) tsserver server started successfully." (tide-project-name))))
@@ -314,11 +363,31 @@ LINE is one based, OFFSET is one based and column is zero based"
 
 ;;; Initialization
 
+(defun tide-file-format-options ()
+  (tide-combine-plists
+   `(:tabSize ,tab-width :indentSize ,(tide-current-indentsize))
+   tide-format-options))
+
+(defun tide-current-indentsize ()
+  (pcase major-mode
+    (`typescript-mode typescript-indent-level)
+    (`js2-mode js2-basic-offset)
+    (`js-mode js-indent-level)
+    (`js3-mode js3-indent-level)
+    (`web-mode web-mode-code-indent-offset)
+    (`js2-jsx-mode sgml-basic-offset)
+    (_ standard-indent)))
+
 (defun tide-command:configure ()
-  (tide-send-command "configure" `(:hostInfo ,(emacs-version) :file ,buffer-file-name :formatOptions (:tabSize ,tab-width :indentSize ,typescript-indent-level :convertTabToSpaces ,(not indent-tabs-mode)))))
+  (tide-send-command "configure" `(:hostInfo ,(emacs-version) :file ,buffer-file-name :formatOptions ,(tide-file-format-options))))
 
 (defun tide-command:openfile ()
-  (tide-send-command "open" `(:file ,buffer-file-name)))
+  (tide-send-command "open"
+                     (append `(:file ,buffer-file-name)
+                             (let ((extension (upcase (file-name-extension buffer-file-name))))
+                               (if (member extension '("TS" "JS" "TSX" "JSX"))
+                                   `(:scriptKindName ,extension)
+                                 nil)))))
 
 (defun tide-command:closefile ()
   (tide-send-command "close" `(:file ,buffer-file-name)))
@@ -328,13 +397,13 @@ LINE is one based, OFFSET is one based and column is zero based"
 (defun tide-command:definition (cb)
   (tide-send-command
    "definition"
-   `(:file ,buffer-file-name :line ,(count-lines 1 (point)) :offset ,(tide-current-offset))
+   `(:file ,buffer-file-name :line ,(tide-line-number-at-pos) :offset ,(tide-current-offset))
    cb))
 
 (defun tide-command:type-definition (cb)
   (tide-send-command
    "typeDefinition"
-   `(:file ,buffer-file-name :line ,(count-lines 1 (point)) :offset ,(tide-current-offset))
+   `(:file ,buffer-file-name :line ,(tide-line-number-at-pos) :offset ,(tide-current-offset))
    cb))
 
 (defun tide-jump-to-definition (&optional arg)
@@ -345,19 +414,24 @@ With a prefix arg, Jump to the type definition."
   (let ((cb (lambda (response)
               (tide-on-response-success response
                 (let ((filespan (car (plist-get response :body))))
-                  (tide-jump-to-filespan filespan t))))))
+                  (tide-jump-to-filespan filespan tide-jump-to-definition-reuse-window))))))
     (if arg
         (tide-command:type-definition cb)
       (tide-command:definition cb))))
 
-(defun tide-move-to-span (span)
-  (let* ((line (plist-get span :line))
-         (offset (plist-get span :offset)))
+(defun tide-move-to-location (location)
+  (let* ((line (plist-get location :line))
+         (offset (plist-get location :offset)))
     (save-restriction
       (widen)
       (goto-char (point-min))
       (forward-line (1- line)))
     (forward-char (1- offset))))
+
+(defun tide-location-to-point (location)
+  (save-excursion
+    (tide-move-to-location location)
+    (point)))
 
 (defun tide-jump-to-filespan (filespan &optional reuse-window no-marker)
   (let ((file (plist-get filespan :file)))
@@ -366,7 +440,7 @@ With a prefix arg, Jump to the type definition."
     (if reuse-window
         (pop-to-buffer (find-file-noselect file) '((display-buffer-reuse-window display-buffer-same-window)))
       (pop-to-buffer (find-file-noselect file)))
-    (tide-move-to-span (plist-get filespan :start))))
+    (tide-move-to-location (plist-get filespan :start))))
 
 (defalias 'tide-jump-back 'pop-tag-mark)
 
@@ -434,7 +508,7 @@ With a prefix arg, Jump to the type definition."
   (let* ((response
           (tide-send-command-sync
            "signatureHelp"
-           `(:file ,buffer-file-name :line ,(count-lines 1 (point)) :offset ,(tide-current-offset)))))
+           `(:file ,buffer-file-name :line ,(tide-line-number-at-pos) :offset ,(tide-current-offset)))))
     (when (tide-response-success-p response)
       (tide-annotate-signatures (plist-get response :body)))))
 
@@ -442,7 +516,7 @@ With a prefix arg, Jump to the type definition."
   (or (looking-at "[(,]") (and (not (looking-at "\\sw")) (looking-back "[(,]\n?\\s-*"))))
 
 (defun tide-command:quickinfo ()
-  (let ((response (tide-send-command-sync "quickinfo" `(:file ,buffer-file-name :line ,(count-lines 1 (point)) :offset ,(tide-current-offset)))))
+  (let ((response (tide-send-command-sync "quickinfo" `(:file ,buffer-file-name :line ,(tide-line-number-at-pos) :offset ,(tide-current-offset)))))
     (when (tide-response-success-p response)
       response)))
 
@@ -482,11 +556,12 @@ With a prefix arg, Jump to the type definition."
   (setq tide-buffer-dirty t))
 
 (defun tide-sync-buffer-contents ()
-  (setq tide-buffer-dirty nil)
-  (when (not tide-buffer-tmp-file)
-    (setq tide-buffer-tmp-file (make-temp-file "tide")))
-  (write-region (point-min) (point-max) tide-buffer-tmp-file nil 'no-message)
-  (tide-send-command "reload" `(:file ,buffer-file-name :tmpfile ,tide-buffer-tmp-file)))
+  (when tide-buffer-dirty
+    (setq tide-buffer-dirty nil)
+    (when (not tide-buffer-tmp-file)
+      (setq tide-buffer-tmp-file (make-temp-file "tide")))
+    (write-region (point-min) (point-max) tide-buffer-tmp-file nil 'no-message)
+    (tide-send-command "reload" `(:file ,buffer-file-name :tmpfile ,tide-buffer-tmp-file))))
 
 
 ;;; Auto completion
@@ -526,7 +601,8 @@ With a prefix arg, Jump to the type definition."
 (defun tide-member-completion-p (prefix)
   (save-excursion
     (backward-char (length prefix))
-    (equal (string (char-before (point))) ".")))
+    (and (> (point) (point-min))
+         (equal (string (char-before (point))) "."))))
 
 (defun tide-annotate-completions (completions prefix file-location)
   (-map
@@ -542,9 +618,9 @@ With a prefix arg, Jump to the type definition."
 
 (defun tide-command:completions (prefix cb)
   (let* ((file-location
-          `(:file ,buffer-file-name :line ,(count-lines 1 (point)) :offset ,(- (tide-current-offset) (length prefix)))))
+          `(:file ,buffer-file-name :line ,(tide-line-number-at-pos) :offset ,(- (tide-current-offset) (length prefix)))))
     (when (not (tide-member-completion-p prefix))
-      (plist-put file-location :prefix prefix))
+      (setq file-location (plist-put file-location :prefix prefix)))
     (tide-send-command
      "completions"
      file-location
@@ -593,6 +669,7 @@ With a prefix arg, Jump to the type definition."
   (cl-case command
     (interactive (company-begin-backend 'company-tide))
     (prefix (and
+             (bound-and-true-p tide-mode)
              (-any-p #'derived-mode-p tide-supported-modes)
              (tide-current-server)
              (not (company-in-string-or-comment))
@@ -607,7 +684,7 @@ With a prefix arg, Jump to the type definition."
 
 (eval-after-load 'company
   '(progn
-     (pushnew 'company-tide company-backends)))
+     (cl-pushnew 'company-tide company-backends)))
 
 ;;; References
 
@@ -656,7 +733,7 @@ With a prefix arg, Jump to the type definition."
 (defun tide-command:references ()
   (tide-send-command-sync
    "references"
-   `(:file ,buffer-file-name :line ,(count-lines 1 (point)) :offset ,(tide-current-offset))))
+   `(:file ,buffer-file-name :line ,(tide-line-number-at-pos) :offset ,(tide-current-offset))))
 
 (defun tide-annotate-line (reference line-text)
   (let ((start (1- (tide-plist-get reference :start :offset)))
@@ -665,7 +742,7 @@ With a prefix arg, Jump to the type definition."
     (put-text-property start end 'tide-reference reference line-text)))
 
 (defun tide-insert-references (references)
-  "Create a buffer with the give REFERENCES.
+  "Create a buffer with the given REFERENCES.
 
 Assumes references are grouped by file name and sorted by line
 number."
@@ -749,7 +826,7 @@ number."
 ;;; Rename
 
 (defun tide-command:rename ()
-  (tide-send-command-sync "rename" `(:file ,buffer-file-name :line ,(count-lines 1 (point)) :offset ,(tide-current-offset))))
+  (tide-send-command-sync "rename" `(:file ,buffer-file-name :line ,(tide-line-number-at-pos) :offset ,(tide-current-offset))))
 
 (defun tide-rename-symbol-at-location (location new-symbol)
   (let ((file (plist-get location :file)))
@@ -757,7 +834,7 @@ number."
       (with-current-buffer (find-file-noselect file)
         (-each
             (-map (lambda (filespan)
-                    (tide-move-to-span (plist-get filespan :start))
+                    (tide-move-to-location (plist-get filespan :start))
                     (cons (point-marker) filespan))
                   (plist-get location :locs))
           (lambda (pointer)
@@ -797,9 +874,47 @@ number."
             (-each (nconc (-reject #'current-file-p locs)
                           (-select #'current-file-p locs))
               (lambda (loc)
-                (incf count (tide-rename-symbol-at-location loc new-symbol))))
+                (cl-incf count (tide-rename-symbol-at-location loc new-symbol))))
 
             (message "Renamed %d occurrences." count)))))))
+
+;;; Format
+
+;;;###autoload
+(defun tide-format-before-save ()
+  "Before save hook to format the buffer before each save."
+  (interactive)
+  (when (bound-and-true-p tide-mode)
+    (tide-format)))
+
+;;;###autoload
+(defun tide-format ()
+  "Format the current region or buffer."
+  (interactive)
+  (if (use-region-p)
+      (tide-format-region (region-beginning) (region-end))
+    (tide-format-region (point-min) (point-max))))
+
+(defun tide-apply-edit (edit)
+  (goto-char (tide-location-to-point (plist-get edit :start)))
+  (delete-region (point) (tide-location-to-point (plist-get edit :end)))
+  (insert (plist-get edit :newText)))
+
+(defun tide-apply-edits (edits)
+  (save-excursion
+    (-each (nreverse edits)
+      (lambda (edit) (tide-apply-edit edit)))))
+
+(defun tide-format-region (start end)
+  (let ((response (tide-send-command-sync
+                "format"
+                `(:file ,buffer-file-name
+                  :line ,(tide-line-number-at-pos start)
+                  :offset ,(tide-offset start)
+                  :endLine ,(tide-line-number-at-pos end)
+                  :endOffset ,(tide-offset end)))))
+    (tide-on-response-success response
+      (tide-apply-edits (plist-get response :body)))))
 
 ;;; Mode
 
@@ -811,8 +926,8 @@ number."
     map))
 
 (defun tide-configure-buffer ()
-  (tide-command:configure)
-  (tide-command:openfile))
+  (tide-command:openfile)
+  (tide-command:configure))
 
 (defun tide-cleanup-buffer ()
   (ignore-errors
@@ -832,10 +947,7 @@ number."
   (set (make-local-variable 'imenu-create-index-function)
        'tide-imenu-index)
 
-  ;; Call configure command right away if called interactively, all
-  ;; the local variables should be set by this time.
-  (when (called-interactively-p 'interactive)
-    (tide-configure-buffer)))
+  (tide-configure-buffer))
 
 ;;;###autoload
 (define-minor-mode tide-mode
@@ -862,10 +974,36 @@ number."
 ;;; Error highlighting
 
 (defun tide-command:geterr (cb)
-  (tide-send-command
-   "geterr"
-   `(:responseType "response" :files (,buffer-file-name))
-   cb))
+  (let* ((result '())
+         (resolved nil)
+         (err nil))
+    (cl-flet
+        ((resolve ()
+                  (when (not resolved)
+                    (if err
+                        (progn
+                          (setq resolved t)
+                          (funcall cb err))
+                      (when (and (plist-member result :syntaxDiag)
+                                 (plist-member result :semanticDiag))
+                        (setq resolved t)
+                        (funcall cb `(:body (,result) :success t)))))))
+      (tide-send-command
+       "syntacticDiagnosticsSync"
+       `(:file ,buffer-file-name)
+       (lambda (response)
+         (if (tide-response-success-p response)
+             (setq result (plist-put result :syntaxDiag (plist-get response :body)))
+           (setq err response))
+         (resolve)))
+      (tide-send-command
+       "semanticDiagnosticsSync"
+       `(:file ,buffer-file-name)
+       (lambda (response)
+         (if (tide-response-success-p response)
+             (setq result (plist-put result :semanticDiag (plist-get response :body)))
+           (setq err response))
+         (resolve))))))
 
 (defun tide-parse-error (response checker)
   (-map
@@ -899,17 +1037,48 @@ number."
     :face (if (tide-current-server) 'success '(bold error)))
    (flycheck-verification-result-new
     :label "Tide mode"
-    :message (if tide-mode "enabled" "disabled")
-    :face (if tide-mode 'success '(bold warning)))))
+    :message (if (bound-and-true-p tide-mode) "enabled" "disabled")
+    :face (if (bound-and-true-p tide-mode) 'success '(bold warning)))))
+
+(defun tide-flycheck-predicate ()
+  (and (bound-and-true-p tide-mode) (tide-current-server) (not (file-equal-p (tide-project-root) tide-tsserver-directory))))
 
 (flycheck-define-generic-checker 'typescript-tide
-  "A syntax checker for Typescript using Tide Mode."
+  "A TypeScript syntax checker using tsserver."
   :start #'tide-flycheck-start
   :verify #'tide-flycheck-verify
-  :modes tide-supported-modes
-  :predicate (lambda () (and tide-mode (tide-current-server) (not (file-equal-p (tide-project-root) tide-tsserver-directory)))))
+  :modes '(typescript-mode)
+  :predicate #'tide-flycheck-predicate)
 
 (add-to-list 'flycheck-checkers 'typescript-tide)
+(flycheck-add-next-checker 'typescript-tide '(warning . typescript-tslint) 'append)
+
+(flycheck-define-generic-checker 'javascript-tide
+  "A Javascript syntax checker using tsserver."
+  :start #'tide-flycheck-start
+  :verify #'tide-flycheck-verify
+  :modes '(js-mode js2-mode js3-mode)
+  :predicate #'tide-flycheck-predicate)
+
+(add-to-list 'flycheck-checkers 'javascript-tide t)
+
+(flycheck-define-generic-checker 'jsx-tide
+  "A JSX syntax checker using tsserver."
+  :start #'tide-flycheck-start
+  :verify #'tide-flycheck-verify
+  :modes '(web-mode js2-jsx-mode)
+  :predicate #'tide-flycheck-predicate)
+
+(add-to-list 'flycheck-checkers 'jsx-tide t)
+
+(flycheck-define-generic-checker 'tsx-tide
+  "A TSX syntax checker using tsserver."
+  :start #'tide-flycheck-start
+  :verify #'tide-flycheck-verify
+  :modes '(web-mode)
+  :predicate #'tide-flycheck-predicate)
+
+(add-to-list 'flycheck-checkers 'tsx-tide)
 
 ;;; Utility commands
 
@@ -922,9 +1091,5 @@ number."
   (tide-each-buffer (tide-project-name) #'tide-configure-buffer))
 
 (provide 'tide)
-
-;; Local Variables:
-;; byte-compile-warnings: (not cl-functions)
-;; End:
 
 ;;; tide.el ends here
