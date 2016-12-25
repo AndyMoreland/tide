@@ -97,7 +97,7 @@ version 2.0 and above."
 
 (defvar tide-supported-modes '(typescript-mode web-mode js-mode js2-mode js2-jsx-mode js3-mode))
 
-(defvar tide-server-buffer-name "*tide-server*")
+(defvar tide-server-buffer-name "tide-server")
 (defvar tide-request-counter 0)
 
 (tide-def-permanent-buffer-local tide-project-root nil)
@@ -175,7 +175,7 @@ ones and overrule settings in the other lists."
       (with-current-buffer buffer
         (when (and (bound-and-true-p tide-mode)
                    (equal (tide-project-name) project-name))
-          (funcall fn))))))
+          (ignore-errors (funcall fn)))))))
 
 (defun tide-line-number-at-pos (&optional pos)
   (let ((p (or pos (point))))
@@ -286,7 +286,9 @@ LINE is one based, OFFSET is one based and column is zero based"
   (with-current-buffer (process-buffer process)
     (goto-char (point-max))
     (insert data))
-  (tide-decode-response process))
+  (condition-case nil
+      (tide-decode-response process)
+    (error "Failed to decode server respones.")))
 
 (defun tide-net-sentinel (process message)
   (let ((project-name (process-get process 'project-name)))
@@ -301,11 +303,11 @@ LINE is one based, OFFSET is one based and column is zero based"
   (message "(%s) Starting tsserver..." (tide-project-name))
   (let* ((default-directory (tide-project-root))
          (process-environment (append tide-tsserver-process-environment process-environment))
-         (buf (generate-new-buffer tide-server-buffer-name))
+         (buf (generate-new-buffer (format "*%s - %s*" tide-server-buffer-name (tide-project-name))))
          (process
           (if tide-tsserver-executable
-              (start-file-process "tsserver" buf "node" tide-tsserver-executable)
-            (start-file-process "tsserver" buf "node" (expand-file-name "tsserver.js" tide-tsserver-directory)))))
+              (start-file-process "tsserver" buf "node" "--trace-warnings" tide-tsserver-executable)
+            (start-file-process "tsserver" buf "node" "--trace-warnings" (expand-file-name "tsserver.js" tide-tsserver-directory)))))
     (set-process-coding-system process 'utf-8-unix 'utf-8-unix)
     (set-process-filter process #'tide-net-filter)
     (set-process-sentinel process #'tide-net-sentinel)
@@ -560,7 +562,7 @@ With a prefix arg, Jump to the type definition."
     (setq tide-buffer-dirty nil)
     (when (not tide-buffer-tmp-file)
       (setq tide-buffer-tmp-file (make-temp-file "tide")))
-    (write-region (point-min) (point-max) tide-buffer-tmp-file nil 'no-message)
+    (write-region nil nil tide-buffer-tmp-file nil 'no-message)
     (tide-send-command "reload" `(:file ,buffer-file-name :tmpfile ,tide-buffer-tmp-file))))
 
 
@@ -679,8 +681,7 @@ With a prefix arg, Jump to the type definition."
                         (tide-command:completions arg cb))))
     (sorted t)
     ;; (meta (tide-completion-meta arg)) ; commented out for performance
-    (annotation (tide-completion-annotation (get-text-property 0 'completion arg)))
-    (doc-buffer (tide-completion-doc-buffer arg))))
+    ))
 
 (eval-after-load 'company
   '(progn
@@ -912,7 +913,9 @@ number."
                   :line ,(tide-line-number-at-pos start)
                   :offset ,(tide-offset start)
                   :endLine ,(tide-line-number-at-pos end)
-                  :endOffset ,(tide-offset end)))))
+                  :endOffset ,(tide-offset end)
+                  :formatOptions (:indentStyle 2
+                                  :indentSize 7)))))
     (tide-on-response-success response
       (tide-apply-edits (plist-get response :body)))))
 
@@ -1066,7 +1069,7 @@ number."
   "A JSX syntax checker using tsserver."
   :start #'tide-flycheck-start
   :verify #'tide-flycheck-verify
-  :modes '(web-mode js2-jsx-mode)
+  :modes '(js2-jsx-mode)
   :predicate #'tide-flycheck-predicate)
 
 (add-to-list 'flycheck-checkers 'jsx-tide t)
@@ -1079,6 +1082,7 @@ number."
   :predicate #'tide-flycheck-predicate)
 
 (add-to-list 'flycheck-checkers 'tsx-tide)
+(flycheck-add-next-checker 'tsx-tide '(warning . typescript-tslint) 'append)
 
 ;;; Utility commands
 
