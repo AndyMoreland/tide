@@ -20,6 +20,7 @@
   (flycheck-mode +1)
   (setq flycheck-check-syntax-automatically '(save mode-enabled))
   (eldoc-mode +1)
+  (tide-hl-identifier-mode +1)
   ;; company is an optional dependency. You have to
   ;; install it separately via package-install
   ;; `M-x package-install [ret] company`
@@ -70,9 +71,11 @@ jsx files. It can be enabled by setting [`flycheck-checker`](http://www.flycheck
 
 ### Notes
 
-* Make sure to add
-  [tsconfig.json](https://github.com/Microsoft/TypeScript/wiki/tsconfig.json)
-  or jsconfig.json in the project root folder.
+* Make sure
+  [tsconfig.json](http://www.typescriptlang.org/docs/handbook/tsconfig-json.html)
+  or
+  [jsconfig.json](https://code.visualstudio.com/docs/languages/jsconfig)
+  is present in the root folder of the project.
 
 * tsserver mangles output
   sometimes [issue - #2758](https://github.com/Microsoft/TypeScript/issues/2758),
@@ -96,6 +99,10 @@ handy after you edit tsconfig.json.
 at point in a buffer. References can be navigated using <kbd>n</kbd>
 and <kbd>p</kbd>. Press <kbd>enter</kbd> to open the file.
 
+<kbd>M-x tide-project-errors</kbd> List all errors in the
+project. Errors can be navigated using <kbd>n</kbd> and
+<kbd>p</kbd>. Press <kbd>enter</kbd> to open the file.
+
 <kbd>M-x tide-rename-symbol</kbd> Rename all occurrences of the symbol
 at point.
 
@@ -110,6 +117,8 @@ at point.
 * Find occurrences
 * Rename symbol
 * Imenu
+* Compile On Save
+* Highlight Identifiers
 
 ### Debugging
 
@@ -133,7 +142,7 @@ file which can be captured by setting
 For TypeScript 2.0 and above, you can customize the
 `tide-tsserver-executable` variable. For example
 ```lisp
-(setq tide-tsserver-executable "/project/node_modules/typescript/bin/tsserver")
+(setq tide-tsserver-executable "node_modules/typescript/bin/tsserver")
 ```
 
 Sadly, this won't work for TypeScript < 2.0. You can clone the repo
